@@ -1,3 +1,5 @@
+import { observeServiceOrigin } from "@/lib/atendimento/origem";
+import { createAdminClient } from "@/lib/supabase/admin";
 /**
  * Core handlers para /api/v1/leads.
  *
@@ -9,11 +11,19 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { ApiError } from "@/lib/api/types";
 import type { Actor, HandlerCtx } from "@/lib/api/handlers/types";
 import { audit } from "@/lib/audit";
+import { traduzir } from "@/lib/i18n/dicionario";
 import { resolveOwnerPatch, type OwnerPatch, type OwnerPatchInput } from "@/lib/leads/owner-patch";
 import { emitLeadActivity, stageChangeReason } from "@/lib/leads/activity-emitter";
 import { listaLegivel } from "@/lib/leads/activity-vocabulary";
 import { camposAlterados } from "@/lib/leads/campos-alterados";
+import { RECUSA_DE_TROCA_DE_FUNIL } from "@/lib/leads/clonar-para-funil";
+import { ORIGEM_DA_PLANILHA } from "@/lib/leads/planilha";
 import { registraFalhaDeAtividade } from "@/lib/leads/activity-write-failure";
+import { moedaDaOrganizacao } from "@/lib/catalogo/moeda-da-org";
+import {
+  decideMotivoDaPerda,
+  recusaDeMotivoDaPerdaPeloBanco,
+} from "@/lib/leads/motivo-da-perda";
 import type { CreateLeadInput, UpdateLeadInput } from "@/lib/schemas";
 import { ehCorrecaoDeMovimentoDaIa } from "@/lib/leads/correcao-humana";
 
@@ -32,6 +42,8 @@ async function ownerPatchOrThrow(
   supabase: SB,
   ctx: HandlerCtx,
   input: OwnerPatchInput,
+  /** Na edição, o responsável que o lead JÁ tem: reenviá-lo não é atribuir. */
+  responsavelAtual: string | null = null,
 ): Promise<OwnerPatch | null> {
   const result = resolveOwnerPatch(input);
   if (!result.ok) {
@@ -40,7 +52,7 @@ async function ownerPatchOrThrow(
       "validation_failed",
       undefined,
       ctx.requestId,
-      "Um lead tem um dono: informe owner_user_id OU owner_agent_id.",
+      traduzir("Um lead tem um dono: informe owner_user_id OU owner_agent_id.", ctx.idioma ?? "pt-BR"),
     );
   }
   if (!result.patch) return null;
@@ -63,12 +75,115 @@ async function ownerPatchOrThrow(
         "validation_failed",
         undefined,
         ctx.requestId,
-        "Agente não encontrado nesta organização.",
+        traduzir("Agente não encontrado nesta organização.", ctx.idioma ?? "pt-BR"),
+      );
+    }
+  }
+
+  // O responsável humano passa pela mesma pergunta que o agente acima: é desta
+  // organização? A FK de `owner_user_id` só garante que a pessoa EXISTE — sem
+  // isto, um id de outra empresa (ou de quem foi desligado) virava dono do
+  // negócio. Régua G3-04, a mesma do bulk-assign e da automação `assign_owner`:
+  // vínculo não revogado e papel acima de viewer.
+  //
+  // Cliente ADMIN, filtrado pela org do contexto: a RLS de `user_organizations`
+  // só mostra a um `agent` a própria linha, e o cliente de sessão recusaria
+  // todo colega legítimo.
+  //
+  // Reenviar o responsável que o lead já tem não é atribuir: sem esta exceção,
+  // um lead cujo dono foi desligado não poderia mais ser editado por quem manda
+  // o formulário inteiro.
+  const responsavel = result.patch.owner_user_id;
+  if (responsavel !== null && responsavel !== responsavelAtual) {
+    const { data: membro, error: membroErr } = await createAdminClient()
+      .from("user_organizations")
+      .select("role")
+      .eq("organization_id", ctx.organization_id)
+      .eq("user_id", responsavel)
+      .is("revoked_at", null)
+      .maybeSingle();
+
+    if (membroErr) {
+      throw new ApiError(500, "internal_error", undefined, ctx.requestId, membroErr.message);
+    }
+    if (!membro || membro.role === "viewer") {
+      throw new ApiError(
+        422,
+        "validation_failed",
+        undefined,
+        ctx.requestId,
+        traduzir("Responsável não é um atendente ativo desta organização.", ctx.idioma ?? "pt-BR"),
       );
     }
   }
 
   return result.patch;
+}
+
+/**
+ * O contato do lead tem de ser DESTA organização.
+ *
+ * A FK `crm_leads_contact_id_fkey` referencia só `contacts(id)`: ela aceita o
+ * contato de qualquer empresa. Todo escritor de lead — tela, MCP, token de
+ * servidor, automação, importação, webhook de entrada, prospecção, clone —
+ * passa por `createLeadHandler`/`updateLeadHandler`, então a pergunta mora aqui.
+ *
+ * 404 igual para "não existe" e "é de outra organização" (molde de
+ * `app/api/v1/agenda/agendamentos/_handler.ts`): a resposta não pode confirmar
+ * que o id existe noutro lugar. E responde ANTES do INSERT, para que um uuid
+ * inexistente não vire 500 com a mensagem da FK.
+ */
+async function contatoDaOrgOrThrow(supabase: SB, ctx: HandlerCtx, contactId: string): Promise<void> {
+  const { data: contato, error: contatoErr } = await supabase
+    .from("contacts")
+    .select("id")
+    .eq("id", contactId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+
+  if (contatoErr) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, contatoErr.message);
+  }
+  if (!contato) {
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Contato não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+}
+
+/**
+ * O gatilho `trg_lead_so_liga_a_propria_empresa` (migration 0403) recusa com
+ * SQLSTATE `PT404`/`PT422` o contato ou responsável de fora da organização. As
+ * guardas acima respondem antes; isto cobre a janela entre conferir e gravar
+ * (um vínculo revogado nesse meio) com a MESMA resposta, e não um 500.
+ */
+function recusaDaGuardaDoBanco(
+  ctx: HandlerCtx,
+  erro: { code?: string } | null,
+): ApiError | null {
+  if (erro?.code === "PT404") {
+    return new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Contato não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+  if (erro?.code === "PT422") {
+    return new ApiError(
+      422,
+      "validation_failed",
+      undefined,
+      ctx.requestId,
+      traduzir("Responsável não é um atendente ativo desta organização.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+  return null;
 }
 
 function actorAuditPayload(actor: Actor): {
@@ -82,6 +197,16 @@ function actorAuditPayload(actor: Actor): {
     return {
       actorUserId: null,
       metadataActor: { actor_type: "webhook_source", actor_id: actor.id },
+    };
+  }
+  // TOKEN DE SERVIDOR é caso próprio, e não o `else` de `ai_agent`: sem esta
+  // linha ele seria auditado como agente de IA, e o audit passaria a afirmar que
+  // uma integração é um agente — a única coisa que o audit não pode fazer é
+  // mentir sobre quem agiu.
+  if (actor.type === "api_token") {
+    return {
+      actorUserId: null,
+      metadataActor: { actor_type: "api_token", actor_api_token_id: actor.id },
     };
   }
   return {
@@ -160,7 +285,13 @@ export async function listLeadsHandler(
   if (q.cursor) {
     const c = decLeadCursor(q.cursor);
     if (!c) {
-      throw new ApiError(400, "invalid_cursor", undefined, ctx.requestId, "Cursor inválido.");
+      throw new ApiError(
+        400,
+        "invalid_cursor",
+        undefined,
+        ctx.requestId,
+        traduzir("Cursor inválido.", ctx.idioma ?? "pt-BR"),
+      );
     }
     query = query.or(
       `created_at.lt.${c.created_at},and(created_at.eq.${c.created_at},id.lt.${c.id})`,
@@ -210,7 +341,13 @@ export async function getLeadHandler(
   if (!data) {
     // 404, e não 403: dizer "existe, mas não é seu" confirmaria a existência de
     // um recurso alheio a quem tentou adivinhar o id.
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Lead não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Lead não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
   }
   return data as Record<string, unknown>;
 }
@@ -227,6 +364,20 @@ export async function createLeadHandler(
     source_metadata?: Record<string, unknown>;
     /** Interno (webhook inbound) — idempotência via uniq_crm_leads_org_source_external. */
     external_id?: string;
+    /**
+     * Interno (importação de planilha). Marca o `lead.created` com
+     * `metadata.via`, e o gatilho de follow-up "Lead criado" não inscreve em
+     * lote quem entrou por planilha. Não vem do corpo da requisição.
+     */
+    via_planilha?: boolean;
+    /**
+     * Interno (clone para outro funil, pela tela ou pela automação). O dono veio
+     * do negócio de ORIGEM, não de quem pediu: se ele não pode mais ser dono
+     * (desligado, virou viewer, agente arquivado), o clone nasce sem dono e a
+     * linha do tempo diz por quê — mover o negócio de funil não pode falhar
+     * porque alguém saiu da empresa. Não vem do corpo da requisição.
+     */
+    dono_herdado?: boolean;
   },
 ): Promise<Record<string, unknown>> {
   // Validate stage belongs to pipeline within active org.
@@ -240,7 +391,13 @@ export async function createLeadHandler(
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, stageErr.message);
   }
   if (!stage || stage.organization_id !== ctx.organization_id) {
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Stage não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Stage não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
   }
   if (stage.pipeline_id !== input.pipeline_id) {
     throw new ApiError(
@@ -248,9 +405,11 @@ export async function createLeadHandler(
       "stage_pipeline_mismatch",
       undefined,
       ctx.requestId,
-      "Stage não pertence ao pipeline informado.",
+      traduzir("Stage não pertence ao pipeline informado.", ctx.idioma ?? "pt-BR"),
     );
   }
+
+  if (input.contact_id) await contatoDaOrgOrThrow(supabase, ctx, input.contact_id);
 
   // next position_in_stage = MAX + 1000.
   const { data: maxRow, error: maxErr } = await supabase
@@ -268,10 +427,33 @@ export async function createLeadHandler(
 
   // Nascer com dono e sem owner_kind é drift silencioso (o CHECK aceita kind
   // null): o lead teria dono e sumiria do filtro e das métricas por kind.
-  const ownerPatch =
-    (await ownerPatchOrThrow(supabase, ctx, input)) ??
-    ({ owner_user_id: null, owner_agent_id: null, owner_kind: null } satisfies OwnerPatch);
+  const semDono = { owner_user_id: null, owner_agent_id: null, owner_kind: null } satisfies OwnerPatch;
+  let donoHerdadoDescartado = false;
+  let ownerPatch: OwnerPatch;
+  try {
+    ownerPatch = (await ownerPatchOrThrow(supabase, ctx, input)) ?? semDono;
+  } catch (erro) {
+    if (!(input.dono_herdado && erro instanceof ApiError && erro.status === 422)) throw erro;
+    ownerPatch = semDono;
+    donoHerdadoDescartado = true;
+  }
 
+  // A moeda de um lead novo é a que a ORGANIZAÇÃO declarou, não um literal.
+  // `"BRL"` aqui (e o `.default("BRL")` que saiu de `createLeadSchema`) fazia
+  // toda organização em peso ou dólar cadastrar lead em real: o valor certo com
+  // o símbolo errado, que é o defeito que a migration 0208 já tinha consertado
+  // no catálogo de produtos. Mesma função daquele conserto, pelo mesmo motivo
+  // (uma leitura só, que não diverge entre caminhos de escrita).
+  //
+  // A leitura extra só acontece quando quem chamou NÃO mandou moeda: a REST com
+  // `currency` no corpo passa direto. O import por planilha e o webhook de
+  // captação NÃO mandam — mandavam `"BRL"` em duro, e o lead de uma organização
+  // em euro nascia em real — e caem aqui. Ela não pode derrubar a criação:
+  // `moedaDaOrganizacao` degrada para o padrão e deixa rastro (console.error +
+  // Sentry) em vez de lançar.
+  const currency = input.currency ?? (await moedaDaOrganizacao(supabase, ctx.organization_id));
+
+  const serviceOrigin = ctx.serviceOrigin ?? await observeServiceOrigin(createAdminClient(), ctx.organization_id, input.contact_id ?? null);
   const { data: lead, error: insErr } = await supabase
     .from("crm_leads")
     .insert({
@@ -282,7 +464,7 @@ export async function createLeadHandler(
       description: input.description ?? null,
       contact_id: input.contact_id ?? null,
       value_cents: input.value_cents ?? null,
-      currency: input.currency ?? "BRL",
+      currency,
       ...ownerPatch,
       assigned_at:
         ownerPatch.owner_kind === null ? null : new Date().toISOString(),
@@ -299,28 +481,60 @@ export async function createLeadHandler(
     .select(LEAD_COLS)
     .single();
 
+  const recusaNoInsert = recusaDaGuardaDoBanco(ctx, insErr);
+  if (recusaNoInsert) throw recusaNoInsert;
   if (insErr || !lead) {
     throw new ApiError(
       500,
       "internal_error",
       undefined,
       ctx.requestId,
-      insErr?.message ?? "Falha ao criar lead.",
+      insErr?.message ?? traduzir("Falha ao criar lead.", ctx.idioma ?? "pt-BR"),
     );
   }
 
+  if (donoHerdadoDescartado) {
+    const leadId = (lead as { id: string }).id;
+    const atividade = await emitLeadActivity(supabase, {
+      organizationId: ctx.organization_id,
+      leadId,
+      contactId: input.contact_id ?? null,
+      type: "lead_edited",
+      sourceModule: "crm",
+      sourceId: leadId,
+      actor: ctx.actor,
+      reason: "Nasceu sem responsável: quem cuidava do negócio de origem não atende mais nesta empresa",
+      payload: { fields: ["owner_user_id", "owner_agent_id"], motivo: "dono_da_origem_inativo" },
+    });
+    if (!atividade.ok) {
+      await registraFalhaDeAtividade(supabase, {
+        organizationId: ctx.organization_id,
+        leadId,
+        tipo: "lead_edited",
+        origem: "leads/_handler.createLeadHandler",
+        erro: atividade.error,
+        requestId: ctx.requestId,
+      });
+    }
+  }
+
   const a = actorAuditPayload(ctx.actor);
-  await supabase
+  await createAdminClient()
     .rpc("emit_event", {
       p_event_type: "lead.created",
       p_entity_kind: "crm_lead",
       p_entity_id: (lead as { id: string }).id,
       p_payload: {
+        service_origin: serviceOrigin,
         pipeline_id: (lead as { pipeline_id: string }).pipeline_id,
         stage_id: (lead as { stage_id: string }).stage_id,
         title: (lead as { title: string }).title,
       },
-      p_metadata: { request_id: ctx.requestId, ...a.metadataActor },
+      p_metadata: {
+        request_id: ctx.requestId,
+        ...a.metadataActor,
+        ...(input.via_planilha ? { via: ORIGEM_DA_PLANILHA } : {}),
+      },
       p_organization_id: ctx.organization_id,
     })
     .then(({ error }) => {
@@ -375,7 +589,18 @@ export async function updateLeadHandler(
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, selErr.message);
   }
   if (!existing) {
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Lead não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Lead não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
+  }
+
+  // Reenviar o contato que o lead já tem não é ligar a um contato novo.
+  if (input.contact_id && input.contact_id !== existing.contact_id) {
+    await contatoDaOrgOrThrow(supabase, ctx, input.contact_id);
   }
 
   const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -386,7 +611,12 @@ export async function updateLeadHandler(
   if (input.currency !== undefined) patch.currency = input.currency;
   // Dono do negócio (0070): regra em lib/leads/owner-patch.ts, compartilhada
   // com create, bulk e MCP. owner_kind é DERIVADO — nunca lido do body.
-  const ownerPatch = await ownerPatchOrThrow(supabase, ctx, input);
+  const ownerPatch = await ownerPatchOrThrow(
+    supabase,
+    ctx,
+    input,
+    (existing.owner_user_id as string | null) ?? null,
+  );
   if (ownerPatch) {
     Object.assign(patch, ownerPatch);
     if (ownerPatch.owner_user_id !== null || ownerPatch.owner_agent_id !== null) {
@@ -397,10 +627,20 @@ export async function updateLeadHandler(
     patch.expected_close_date = input.expected_close_date;
   }
   if (input.tags !== undefined) patch.tags = input.tags;
+  if (input.custom_fields !== undefined) {
+    const prev =
+      existing.custom_fields && typeof existing.custom_fields === "object" && !Array.isArray(existing.custom_fields)
+        ? (existing.custom_fields as Record<string, unknown>)
+        : {};
+    patch.custom_fields = { ...prev, ...input.custom_fields };
+  }
 
   // O filtro entra AQUI TAMBÉM, e não só no SELECT acima: entre ler e escrever
   // há uma janela, e defesa que depende de uma leitura anterior é defesa que
   // some quando alguém reordena o código.
+  const tagServiceOrigin = input.tags !== undefined
+    ? ctx.serviceOrigin ?? await observeServiceOrigin(createAdminClient(), ctx.organization_id, input.contact_id ?? existing.contact_id)
+    : null;
   const { data: updated, error: updErr } = await supabase
     .from("crm_leads")
     .update(patch)
@@ -409,11 +649,19 @@ export async function updateLeadHandler(
     .select(LEAD_COLS)
     .maybeSingle();
 
+  const recusaNoUpdate = recusaDaGuardaDoBanco(ctx, updErr);
+  if (recusaNoUpdate) throw recusaNoUpdate;
   if (updErr) {
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, updErr.message);
   }
   if (!updated) {
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Lead não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Lead não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
   }
 
   const a = actorAuditPayload(ctx.actor);
@@ -489,12 +737,12 @@ export async function updateLeadHandler(
     const prevTags: string[] = (existing as { tags?: string[] }).tags ?? [];
     const addedTags = input.tags.filter((t) => !prevTags.includes(t));
     if (addedTags.length) {
-      await supabase
+      await createAdminClient()
         .rpc("emit_event", {
           p_event_type: "lead.tag_added",
           p_entity_kind: "crm_lead",
           p_entity_id: leadId,
-          p_payload: { added_tags: addedTags, tags: input.tags },
+          p_payload: { added_tags: addedTags, tags: input.tags, service_origin: tagServiceOrigin },
           p_metadata: { request_id: ctx.requestId, ...a.metadataActor },
           p_organization_id: existing.organization_id,
         })
@@ -503,6 +751,22 @@ export async function updateLeadHandler(
         });
     }
   }
+
+  // ── A ÚLTIMA LEITURA VEM DEPOIS DA ÚLTIMA ESCRITA (issue #916) ─────────────
+  //
+  // O mesmo defeito do `moveLeadHandler`, no PATCH do dossiê: `updated` é o
+  // retorno do UPDATE, e a atividade `lead_edited` gravada acima está na lista
+  // positiva de `fn_update_last_activity_at` (supabase/baseline.sql) — o gatilho
+  // faz `update crm_leads` numa transação POSTERIOR, e `fn_set_updated_at` troca
+  // o `updated_at` de novo. Devolver `updated` entregava ao quadro um carimbo
+  // que a própria edição já invalidou: `useEditLead` o grava no cache, e o
+  // arrasto seguinte levava 409 mesmo com o conserto do cliente.
+  const { data: fresh } = await supabase
+    .from("crm_leads")
+    .select(LEAD_COLS)
+    .eq("organization_id", ctx.organization_id)
+    .eq("id", leadId)
+    .maybeSingle();
 
   await audit({
     action: "lead.updated",
@@ -514,7 +778,7 @@ export async function updateLeadHandler(
     metadata: { ...a.metadataActor, fields },
   });
 
-  return updated as Record<string, unknown>;
+  return (fresh ?? updated) as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +790,18 @@ export interface MoveLeadAdminInput {
   /** Optional fractional position. If omitted, append at end (max + 1000). */
   position_in_stage?: number;
   reason?: string;
+  /**
+   * O motivo da perda, quando a etapa de destino é de perda (issue #917).
+   *
+   * ⚠️ NÃO é o mesmo `reason` de cima, e por isso são dois campos: `reason` é a
+   * nota humana que entra na timeline ("cliente achou caro"), texto livre; este é
+   * o `crm_leads.lost_reason`, que o banco confere contra o vocabulário do funil
+   * (canônico + `settings.lost_reasons` do pipeline). Um valor de texto livre aqui
+   * não é recusado por esta função — é recusado pelo trigger, e a rota devolve a
+   * recusa de negócio (`recusaDeMotivoDaPerdaPeloBanco`). Quem decide se há de
+   * exigir ou não é `lib/leads/motivo-da-perda.ts`, o mesmo dos outros caminhos.
+   */
+  lost_reason?: string | null;
 }
 
 export async function moveLeadHandler(
@@ -544,27 +820,39 @@ export async function moveLeadHandler(
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, selErr.message);
   }
   if (!lead || lead.organization_id !== ctx.organization_id) {
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Lead não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Lead não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
   }
 
   const { data: stage, error: stageErr } = await supabase
     .from("crm_stages")
-    .select("id, pipeline_id, organization_id, name")
+    .select("id, pipeline_id, organization_id, name, is_lost")
     .eq("id", input.to_stage_id)
     .maybeSingle();
   if (stageErr) {
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, stageErr.message);
   }
   if (!stage || stage.organization_id !== ctx.organization_id) {
-    throw new ApiError(404, "not_found", undefined, ctx.requestId, "Stage não encontrado.");
+    throw new ApiError(
+      404,
+      "not_found",
+      undefined,
+      ctx.requestId,
+      traduzir("Stage não encontrado.", ctx.idioma ?? "pt-BR"),
+    );
   }
   if (stage.pipeline_id !== lead.pipeline_id) {
     throw new ApiError(
       422,
       "pipeline_immutable_use_clone",
-      undefined,
+      { use: "/api/v1/leads/{id}/clone" },
       ctx.requestId,
-      "Move cross-pipeline não é permitido.",
+      traduzir(RECUSA_DE_TROCA_DE_FUNIL, ctx.idioma ?? "pt-BR"),
     );
   }
 
@@ -580,6 +868,22 @@ export async function moveLeadHandler(
     position = maxRow?.position_in_stage ? Number(maxRow.position_in_stage) + 1000 : 1000;
   }
 
+  // ── O MOTIVO DA PERDA (issue #917) ──────────────────────────────────────────
+  //
+  // Este handler é o escritor de etapa de TODOS os clientes que não são o board
+  // (MCP `crm_move_lead_stage`, ações de automação), e a regra é a mesma do
+  // arrasto: etapa de perda exige motivo, e o motivo sai na mesma escrita.
+  const veredito = decideMotivoDaPerda({
+    etapaDeDestino: stage,
+    motivo: input.lost_reason,
+    motivoAtual: (lead as { lost_reason?: string | null }).lost_reason ?? null,
+    idioma: ctx.idioma,
+  });
+  if (!veredito.ok) {
+    throw new ApiError(422, veredito.codigo, undefined, ctx.requestId, veredito.mensagem);
+  }
+
+  const serviceOrigin = ctx.serviceOrigin ?? await observeServiceOrigin(createAdminClient(), ctx.organization_id, lead.contact_id);
   const nowIso = new Date().toISOString();
   const { data: updated, error: updErr } = await supabase
     .from("crm_leads")
@@ -587,6 +891,7 @@ export async function moveLeadHandler(
       stage_id: input.to_stage_id,
       position_in_stage: position,
       updated_at: nowIso,
+      ...veredito.patch,
     })
     .eq("id", leadId)
     .eq("updated_at", lead.updated_at)
@@ -594,6 +899,12 @@ export async function moveLeadHandler(
     .maybeSingle();
 
   if (updErr) {
+    // Rede de segurança (#917) — mesma da rota de arrasto: recusa do banco por
+    // motivo da perda vira recusa de negócio, nunca 500.
+    const recusa = recusaDeMotivoDaPerdaPeloBanco(updErr, ctx.idioma);
+    if (recusa) {
+      throw new ApiError(422, recusa.codigo, undefined, ctx.requestId, recusa.mensagem);
+    }
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, updErr.message);
   }
   if (!updated) {
@@ -602,29 +913,26 @@ export async function moveLeadHandler(
       "lead_stage_changed_concurrent",
       undefined,
       ctx.requestId,
-      "Lead foi modificado concorrentemente.",
+      traduzir("Lead foi modificado concorrentemente.", ctx.idioma ?? "pt-BR"),
     );
   }
 
-  const { data: fresh } = await supabase
-    .from("crm_leads")
-    .select("*")
-    .eq("id", leadId)
-    .maybeSingle();
-  const finalLead = (fresh ?? updated) as Record<string, unknown>;
-
   const a = actorAuditPayload(ctx.actor);
-  await supabase
+  await createAdminClient()
     .rpc("emit_event", {
       p_event_type: "lead.stage_changed",
       p_entity_kind: "crm_lead",
       p_entity_id: leadId,
       p_payload: {
+        service_origin: serviceOrigin,
         pipeline_id: lead.pipeline_id,
         from_stage_id: lead.stage_id,
         to_stage_id: input.to_stage_id,
         position_in_stage: position,
-        status: (finalLead as { status: string }).status,
+        // `updated` é o retorno do próprio UPDATE, e `trg_crm_lead_close_on_stage`
+        // é BEFORE (baseline.sql): o `status` que o gatilho escreveu já está
+        // aqui. Ler a releitura do fim seria amarrar este evento à ordem dela.
+        status: (updated as { status: string }).status,
       },
       p_metadata: { request_id: ctx.requestId, ...a.metadataActor },
       p_organization_id: lead.organization_id,
@@ -745,6 +1053,28 @@ export async function moveLeadHandler(
       requestId: ctx.requestId,
     });
   }
+
+  // ── A ÚLTIMA LEITURA VEM DEPOIS DA ÚLTIMA ESCRITA (issue #916) ─────────────
+  //
+  // Reler o lead ANTES de gravar a atividade devolvia um `updated_at` que a
+  // própria requisição já invalidava: o INSERT de `stage_changed` dispara
+  // `trg_update_last_activity_at`, cuja lista positiva inclui `stage_changed`
+  // (baseline.sql), e o `update crm_leads` dele passa por `fn_set_updated_at`
+  // (`new.updated_at := now()`, incondicional). Quem guardar esta resposta para
+  // a próxima trava otimista leva 409 no gesto seguinte.
+  //
+  // Este é o caminho da IA, do lote e das automações — o irmão de
+  // `app/api/v1/leads/[id]/move/route.ts`, onde a mesma inversão já foi
+  // corrigida. `agent_move_corrected` NÃO está na lista positiva, mas a
+  // releitura vem depois dele também: a ordem certa não depende de qual tipo
+  // está na lista hoje.
+  const { data: fresh } = await supabase
+    .from("crm_leads")
+    .select("*")
+    .eq("id", leadId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+  const finalLead = (fresh ?? updated) as Record<string, unknown>;
 
   await audit({
     action: "lead.moved",

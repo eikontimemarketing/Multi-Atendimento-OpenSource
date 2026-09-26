@@ -237,6 +237,26 @@ export const CONEXOES_QUE_NAO_CONTAM: readonly SituacaoDaConexao[] =
 export const PROVEDORES_DE_AGENDA = ["google_calendar"] as const;
 export type ProvedorDeAgenda = (typeof PROVEDORES_DE_AGENDA)[number];
 
+/**
+ * O provider do Google, para quem CONSULTA — e não só para quem tipa.
+ *
+ * ⚠️ ESTE SÍMBOLO EXISTE PORQUE A CONSTANTE ACIMA ERA ÓRFÃ. Ela estava aqui com
+ * ZERO consumidores de produção (medido), enquanto três consultas filtravam por
+ * `"google"` — um valor que o CHECK de `calendar_connections.provider` PROÍBE
+ * existir. Elas casavam zero linhas por construção, e o efeito foi a conexão do
+ * Google ficar invisível na v1.9.0: o botão "Conectar Google" não sumia depois de
+ * conectar, a ida ao Google nunca saía, e desconectar respondia 404.
+ *
+ * Símbolo canônico que ninguém importa não é fonte da verdade — é documentação
+ * que o compilador não confere. Um valor tipado que os call sites de fato usam é.
+ *
+ * A varredura que prende isso é `tests/unit/consulta-usa-o-vocabulario-do-banco`,
+ * e ela é a segunda guarda de propósito: `tests/invariants/agenda-vocabulario`
+ * compara o CHECK do banco com a constante e fica VERDE, porque o valor errado
+ * não estava em nenhum dos dois — estava no literal dentro do `.eq()`.
+ */
+export const PROVEDOR_GOOGLE: ProvedorDeAgenda = "google_calendar";
+
 /** O que o Google diz sobre um evento ocupar ou não a hora. */
 export const TRANSPARENCIAS_EXTERNAS = ["opaque", "transparent"] as const;
 export type TransparenciaExterna = (typeof TRANSPARENCIAS_EXTERNAS)[number];
@@ -256,6 +276,34 @@ export type SituacaoExterna = (typeof SITUACOES_EXTERNAS)[number];
  */
 export const ALVO_DE_VINCULO_DO_AGENDAMENTO = "appointment" as const;
 export const VINCULO_DE_AGENDAMENTO = "scheduled" as const;
+
+/**
+ * O `entity_kind` do compromisso no `event_log`.
+ *
+ * É a TABELA no singular (`calendar_appointments` → `calendar_appointment`), e
+ * não o `appointment` do vínculo acima: são vocabulários de tabelas diferentes,
+ * e o motor de regras compara este valor contra `EXPECTED_ENTITY_KIND` para
+ * decidir se o evento é dele. Aproximar as duas strings porque "parecem a mesma
+ * coisa" faria o motor descartar todo gatilho de agenda em silêncio, como
+ * `entity_kind_mismatch` — que é exatamente o defeito que aquele guard existe
+ * para pegar em `lead` vs `crm_lead`.
+ */
+export const ENTIDADE_DO_AGENDAMENTO = "calendar_appointment" as const;
+
+/**
+ * O nome a usar quando o tipo do compromisso não pôde ser lido.
+ *
+ * ⚠️ É FALLBACK, NÃO PADRÃO. Ele descreve a categoria, não o atendimento, e
+ * nenhuma condição de automação escrita por um operador vai casar com ele de
+ * propósito. Existe só para o caso real de o tipo ter sido apagado depois do
+ * compromisso ter nascido — o caminho normal lê `calendar_event_types.name`.
+ *
+ * Enquanto esta string era digitada como literal dentro dos handlers, ela ERA o
+ * caminho normal em três dos quatro gatilhos, e o efeito foi uma condição
+ * decorativa: a tela oferece "Tipo de atendimento contém …", a pessoa configura,
+ * salva, e a regra nunca dispara porque o payload sempre dizia "Agendamento".
+ */
+export const NOME_GENERICO_DO_TIPO = "Agendamento" as const;
 
 /**
  * O tipo de atividade que o agendamento emite na timeline do lead.
@@ -338,4 +386,53 @@ export function trilhaPadraoDoMembro(userId: string): TrilhaDaAgenda {
   // O índice é sempre válido (módulo do tamanho), mas o TypeScript não sabe
   // disso com `noUncheckedIndexedAccess`.
   return trilha ?? TRILHAS_DA_AGENDA[0];
+}
+
+/**
+ * As trilhas de uma EQUIPE, sem duas pessoas na mesma cor.
+ *
+ * ⚠️ `trilhaPadraoDoMembro` sozinha não resolve isto, e não é defeito dela: ela é
+ * um hash módulo 8, e hash dá ESTABILIDADE (a mesma pessoa sempre na mesma cor),
+ * nunca DISTINÇÃO. Com 5 pessoas e 8 trilhas, a chance de pelo menos uma colisão
+ * passa de 60% — e medido nesta organização, duas pessoas caíram na trilha 7.
+ *
+ * O sintoma é o que o sistema de cores existe para impedir: na grade, duas
+ * pessoas viram uma só, e quem olha não distingue de quem é o compromisso.
+ *
+ * ─── Por que não ordenar e distribuir 1..8 ───────────────────────────────
+ *
+ * Porque aí a cor de cada um passa a depender de QUEM MAIS está na lista: entra
+ * alguém novo e a equipe inteira troca de cor. A cor deixaria de ser aprendível,
+ * que é a razão de ela existir.
+ *
+ * ─── O que esta função faz ───────────────────────────────────────────────
+ *
+ * Parte do hash — todo mundo fica na cor de sempre — e resolve APENAS as
+ * colisões, avançando para a próxima trilha livre. Quem chegou primeiro na
+ * ordem estável (o id) mantém a sua; só quem colidiu se move. Trocar a ordem de
+ * entrada não muda o resultado, porque a ordenação é pelo id e não pela chegada.
+ *
+ * Com mais pessoas do que trilhas, a repetição volta — e aí é inevitável: são
+ * oito cores. Quando isso acontecer, a resposta é mais trilhas na paleta, não
+ * mais lógica aqui.
+ */
+export function trilhasDaEquipe(userIds: readonly string[]): Map<string, TrilhaDaAgenda> {
+  const resultado = new Map<string, TrilhaDaAgenda>();
+  const ocupadas = new Set<TrilhaDaAgenda>();
+  // Ordem estável e independente de como a lista chegou.
+  for (const id of [...userIds].sort()) {
+    if (resultado.has(id)) continue;
+    const inicio = TRILHAS_DA_AGENDA.indexOf(trilhaPadraoDoMembro(id));
+    let escolhida = trilhaPadraoDoMembro(id);
+    for (let passo = 0; passo < TRILHAS_DA_AGENDA.length; passo += 1) {
+      const candidata = TRILHAS_DA_AGENDA[(inicio + passo) % TRILHAS_DA_AGENDA.length];
+      if (candidata !== undefined && !ocupadas.has(candidata)) {
+        escolhida = candidata;
+        break;
+      }
+    }
+    ocupadas.add(escolhida);
+    resultado.set(id, escolhida);
+  }
+  return resultado;
 }

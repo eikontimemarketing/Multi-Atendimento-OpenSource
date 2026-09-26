@@ -19,8 +19,17 @@ describe("montarRequisicaoDeProva", () => {
   it("sabe cobrar TODOS os provedores que a lista oferece", () => {
     // Se a lista ganhar um provedor e este módulo não souber testá-lo, o
     // diagnóstico ficaria mudo justamente para quem escolheu o mais novo.
+    // `custom` nasce com o endereço na credencial: sem ele a prova não tem
+    // para onde ir, e recusar é o comportamento certo — mas a lista dos
+    // OUTROS segue medida sem endereço nenhum.
     const semProva = IDS_DE_PROVEDOR.filter(
-      (id) => montarRequisicaoDeProva(id, "k", "m") === null,
+      (id) =>
+        montarRequisicaoDeProva(
+          id,
+          "k",
+          "m",
+          id === "custom" ? "https://gw.exemplo/v1" : undefined,
+        ) === null,
     );
     expect(semProva).toEqual([]);
   });
@@ -28,7 +37,12 @@ describe("montarRequisicaoDeProva", () => {
   it("é uma GERAÇÃO, não uma listagem — é o que o provedor cobra", () => {
     // O ponto do arquivo inteiro: listar modelos passa com saldo zero.
     for (const id of IDS_DE_PROVEDOR) {
-      const req = montarRequisicaoDeProva(id, "k", "modelo-x");
+      const req = montarRequisicaoDeProva(
+        id,
+        "k",
+        "modelo-x",
+        id === "custom" ? "https://gw.exemplo/v1" : undefined,
+      );
       expect(req, id).not.toBeNull();
       expect(req!.url, `${id} está batendo num endpoint de catálogo`).not.toMatch(/\/models$/);
     }
@@ -39,14 +53,48 @@ describe("montarRequisicaoDeProva", () => {
     expect(anthropic!.body).toMatchObject({ max_tokens: 1 });
   });
 
+  it("OpenAI usa max_completion_tokens — max_tokens é recusado pelos modelos de raciocínio (o1/o3/gpt-5)", () => {
+    // Medido em produção: o modelo padrão curado para OpenAI é da família de
+    // raciocínio, e ela responde 400 "Unsupported parameter: 'max_tokens' is
+    // not supported with this model. Use 'max_completion_tokens' instead."
+    // Isso derrubava a prova de crédito no onboarding com toda chave válida.
+    const openai = montarRequisicaoDeProva("openai", "k", "gpt-5.6-terra");
+    expect(openai!.body).toMatchObject({ max_completion_tokens: 1 });
+    expect(openai!.body).not.toHaveProperty("max_tokens");
+  });
+
   it("provedor desconhecido não recebe 'ok' por omissão", () => {
     expect(montarRequisicaoDeProva("inventado", "k", "m")).toBeNull();
   });
 });
 
 describe("classificarResposta", () => {
-  it("200 é a única forma de passar", () => {
+  it("200 passa", () => {
     expect(classificarResposta(200, "{}")).toEqual({ ok: true });
+  });
+
+  it("400 de 'limite de saída atingido' passa: a chave foi aceita e a cobrança atravessada (#1693)", () => {
+    // Corpo REAL da OpenAI, medido em 2026-09-26 com uma chave boa e o modelo
+    // curado padrão (gpt-5.6-terra, de raciocínio): com `max_completion_tokens: 1`
+    // ele gasta o único token pensando e a API recusa DEPOIS de começar a gerar.
+    const corpo = JSON.stringify({
+      error: {
+        message:
+          "Could not finish the message because max_tokens or model output limit was reached. Please try again with higher max_tokens.",
+        type: "invalid_request_error",
+        param: null,
+        code: null,
+      },
+    });
+    expect(classificarResposta(400, corpo)).toEqual({ ok: true });
+  });
+
+  it("outro 400 continua reprovando — só o 'limite de saída' prova a cobrança", () => {
+    const r = classificarResposta(
+      400,
+      '{"error":{"message":"Unsupported parameter: \'max_tokens\' is not supported with this model.","type":"invalid_request_error"}}',
+    );
+    expect(r.ok).toBe(false);
   });
 
   it("saldo/limite tem balde próprio — é o caso que o selo 'Validada' escondia", () => {

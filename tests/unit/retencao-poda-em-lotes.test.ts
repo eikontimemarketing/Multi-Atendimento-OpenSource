@@ -12,10 +12,15 @@ import {
 import {
   RETENCAO_AUDITORIA_DIAS_PADRAO,
   RETENCAO_AUDITORIA_DIAS_PISO,
+  RETENCAO_AVISO_DE_CASO_DIAS_PADRAO,
+  RETENCAO_CONVERSA_DO_CASO_DIAS_PADRAO,
   RETENCAO_ESPELHO_AGENDA_DIAS_PADRAO,
   RETENCAO_ESPELHO_AGENDA_DIAS_PISO,
   RETENCAO_FILA_DIAS_PADRAO,
+  RETENCAO_PASSAGEM_DIAS_PADRAO,
   RETENCAO_FILA_DIAS_PISO,
+  RETENCAO_PROSPECCAO_DIAS_PADRAO,
+  RETENCAO_PROSPECCAO_DIAS_PISO,
   interpretarRetencao,
 } from "@/lib/retencao/politica";
 
@@ -35,8 +40,27 @@ let respostaRpc: { data: number | null; error: { message: string } | null } = {
   data: 0,
   error: null,
 };
+/**
+ * As linhas que a varredura de anonimização enxerga nesta rodada. Vazio por
+ * padrão: os casos deste arquivo medem a PODA, e uma varredura com trabalho a
+ * fazer acrescentaria linhas de auditoria que confundiriam a contagem — o que a
+ * varredura faz é medido em `lgpd-varredura-completa-a-cascata.test.ts`.
+ */
+let contatosAnonimizados: Array<{ id: string; organization_id: string }> = [];
 vi.mock("@/lib/supabase/admin", () => ({
-  createAdminClient: () => ({ rpc: async () => respostaRpc }),
+  createAdminClient: () => ({
+    rpc: async () => respostaRpc,
+    from: () => {
+      const q: Record<string, unknown> = {
+        eq: () => q,
+        in: () => q,
+        limit: () => q,
+        then: (r: (v: unknown) => unknown) =>
+          Promise.resolve({ data: contatosAnonimizados, error: null }).then(r),
+      };
+      return { select: () => q, update: () => q };
+    },
+  }),
 }));
 
 /**
@@ -163,6 +187,19 @@ describe("podarHistorico — o laço de lotes", () => {
     expect(r.avisos).toHaveLength(2);
   });
 
+  it("drena a prospecção com o padrão 365 e eleva o knob de 5 ao piso 90", async () => {
+    // A oitava poda entra no MESMO commit da migration (0408): o knob abaixo
+    // do piso é ELEVADO, como todas as irmãs — e o aviso acompanha.
+    const { db, chamadas } = bancoQueDevolve({ fila: [0], auditoria: [0] });
+    const r = await podarHistorico(db, { PROSPECCAO_RETENTION_DAYS: "5" });
+    const ultima = chamadas[chamadas.length - 1];
+    expect(ultima?.nome).toBe("fn_expurgar_prospeccao_vencida");
+    expect(ultima?.dias).toBe(RETENCAO_PROSPECCAO_DIAS_PISO);
+    expect(r.retencao_prospeccao_dias).toBe(RETENCAO_PROSPECCAO_DIAS_PISO);
+    expect(r.avisos).toHaveLength(1);
+    expect(r.avisos[0]).toContain("PROSPECCAO_RETENTION_DAYS");
+  });
+
   it("erro do banco sobe — a poda não engole falha em silêncio", async () => {
     const db: PodaDb = {
       async rpc() {
@@ -189,6 +226,26 @@ describe("houveEfeito — as duas direções", () => {
     retencao_fila_dias: RETENCAO_FILA_DIAS_PADRAO,
     retencao_auditoria_dias: RETENCAO_AUDITORIA_DIAS_PADRAO,
     retencao_espelho_dias: RETENCAO_ESPELHO_AGENDA_DIAS_PADRAO,
+    // Quinta poda (migration 0281): a conversa da equipe com a IA sobre um caso.
+    conversa_do_caso_apagada: 0,
+    lotes_conversa_do_caso: 0,
+    conversa_do_caso_tem_resto: false,
+    retencao_conversa_do_caso_dias: RETENCAO_CONVERSA_DO_CASO_DIAS_PADRAO,
+    // Sexta poda (migration 0291): o registro da passagem para uma pessoa.
+    passagens_apagadas: 0,
+    lotes_passagens: 0,
+    passagens_tem_resto: false,
+    retencao_passagem_dias: RETENCAO_PASSAGEM_DIAS_PADRAO,
+    // Sétima poda (migration 0292): o registro de entrega do aviso de caso.
+    avisos_de_caso_apagados: 0,
+    lotes_avisos_de_caso: 0,
+    avisos_de_caso_tem_resto: false,
+    retencao_aviso_de_caso_dias: RETENCAO_AVISO_DE_CASO_DIAS_PADRAO,
+    // Oitava poda (migration 0408): o candidato de prospecção vencido.
+    prospeccao_apagada: 0,
+    lotes_prospeccao: 0,
+    prospeccao_tem_resto: false,
+    retencao_prospeccao_dias: RETENCAO_PROSPECCAO_DIAS_PADRAO,
     avisos: [] as string[],
   };
 
@@ -204,11 +261,40 @@ describe("houveEfeito — as duas direções", () => {
     expect(houveEfeito({ ...base, nonces_apagados: 1 })).toBe(true);
   });
 
+  it("...e apagou candidato de prospecção vencido → TAMBÉM audita (0408)", () => {
+    // A oitava poda entra em `houveEfeito` no MESMO commit em que entra no
+    // laço — é a lição da quarta e da quinta. E esta é a única poda da casa
+    // que apaga dado de uma pessoa que NUNCA falou com a empresa: silenciar
+    // aqui seria apagar dado sensível sem trilha.
+    expect(houveEfeito({ ...base, prospeccao_apagada: 1 })).toBe(true);
+  });
+
   it("apagou job → audita; apagou auditoria → audita", () => {
     // A segunda é a que não pode se perder: é ela que faz o expurgo do audit
     // deixar rastro em vez de encolher a trilha em silêncio.
     expect(houveEfeito({ ...base, jobs_apagados: 1 })).toBe(true);
     expect(houveEfeito({ ...base, auditoria_apagada: 1 })).toBe(true);
+  });
+
+  it("...e apagou conversa do caso → TAMBÉM audita (migration 0281)", () => {
+    // A quinta poda entra em `houveEfeito` no MESMO commit em que entra no
+    // laço: as quatro anteriores mostram que esquecer o predicado é o modo de
+    // falha natural aqui, e ele é mudo — a rodada apaga e não deixa registro.
+    expect(houveEfeito({ ...base, conversa_do_caso_apagada: 1 })).toBe(true);
+  });
+
+  it("...e apagou passagem vencida → TAMBÉM audita (migration 0291)", () => {
+    // A sexta poda entra em `houveEfeito` no MESMO commit em que entra no laço.
+    // As cinco anteriores já mostram que esquecer o predicado é o modo de falha
+    // natural aqui — e ele é mudo: a rodada apaga e não deixa registro.
+    expect(houveEfeito({ ...base, passagens_apagadas: 1 })).toBe(true);
+  });
+
+  it("...e apagou entrega de aviso vencida → TAMBÉM audita (migration 0292)", () => {
+    // A sétima poda entra em `houveEfeito` no MESMO commit em que entra no laço.
+    // As seis anteriores já mostram que esquecer o predicado é o modo de falha
+    // natural aqui — e ele é mudo: a rodada apaga e não deixa registro.
+    expect(houveEfeito({ ...base, avisos_de_caso_apagados: 1 })).toBe(true);
   });
 
   it("...e apagou espelho da agenda → TAMBÉM audita (migration 0187)", () => {
@@ -263,6 +349,7 @@ describe("o handler HTTP — a falha entra na trilha, o vazio não", () => {
 
   beforeEach(() => {
     auditou.mockClear();
+    contatosAnonimizados = [];
   });
 
   it("rodada que não apagou nada responde 200 e NÃO audita", async () => {

@@ -78,6 +78,43 @@ test.describe("a Agenda como o dono do produto a usa", () => {
       els.map((e) => (e as HTMLElement).dataset.trilha),
     );
     expect(trilhas.every((t) => t && Number(t) >= 1 && Number(t) <= 8)).toBe(true);
+
+    // ⚠️ O INTERVALO SOZINHO É PARCIALMENTE VÁCUO, e o comentário acima já
+    // AFIRMAVA o que ele não media: "trilhas diferentes entre si". Se
+    // `trilhaPadraoDoMembro` devolvesse 1 para todo mundo, o `every` acima
+    // passaria — e a agenda desenharia a equipe inteira na mesma cor, que é
+    // exatamente o que o sistema de cores existe para impedir.
+    // ⚠️ POR PESSOA, e não por ELEMENTO — minha primeira versão comparou
+    // `new Set(trilhas).size` com `trilhas.length` e reprovou dizendo "19 contra
+    // 4". Medido: a organização tem CINCO pessoas e o locator casa 19 avatares,
+    // porque a mesma pessoa aparece no filtro E em cada card da grade. Repetir a
+    // trilha ali é o comportamento CERTO — é a mesma pessoa.
+    //
+    // A propriedade que importa é: duas pessoas DIFERENTES não compartilham
+    // trilha. O `data-testid` carrega o id, então dá para parear.
+    const porPessoa = await avatares.evaluateAll((els) =>
+      els.map((e) => ({
+        pessoa: (e as HTMLElement).dataset.testid?.replace("avatar-pessoa-", "") ?? "",
+        trilha: (e as HTMLElement).dataset.trilha ?? "",
+      })),
+    );
+    const trilhaDe = new Map<string, string>();
+    const colisoes: string[] = [];
+    for (const { pessoa, trilha } of porPessoa) {
+      for (const [outra, t] of trilhaDe) {
+        if (outra !== pessoa && t === trilha) colisoes.push(`${outra} e ${pessoa} → trilha ${t}`);
+      }
+      trilhaDe.set(pessoa, trilha);
+    }
+    expect(
+      trilhaDe.size,
+      "o filtro tem menos de duas pessoas distintas — o teste de colisão mede o vazio",
+    ).toBeGreaterThan(1);
+    expect(
+      [...new Set(colisoes)],
+      "duas pessoas DIFERENTES ganharam a mesma trilha de cor — na grade elas viram " +
+        "uma só, e quem olha não distingue de quem é o compromisso",
+    ).toEqual([]);
   });
 
   test("o histórico está NA TELA DO PRODUTO, com as quatro abas", async () => {
@@ -117,6 +154,91 @@ test.describe("a Agenda como o dono do produto a usa", () => {
     }
   });
 
+  test("as três visões desenham, e a régua do agora existe — NO PRODUTO", async () => {
+    // ⚠️ Isto estava provado só em `agenda-kit-visual`, que roda contra
+    // `/vitrine-agenda` — página de demonstração com dado de mentira. A vitrine
+    // prova o DESENHO; ela não prova que a tela que o cliente abre desenha.
+    await expect(page.getByTestId("grade-da-agenda")).toBeVisible({ timeout: ESPERA });
+
+    const alternador = page.getByTestId("alternador-de-visao");
+    for (const visao of ["Dia", "Mês", "Semana"]) {
+      await alternador.getByRole("button", { name: visao, exact: true }).click();
+      await expect(
+        page.getByTestId("grade-da-agenda"),
+        `a grade sumiu ao trocar para "${visao}"`,
+      ).toBeVisible({ timeout: ESPERA });
+      await expect(
+        alternador.getByRole("button", { name: visao, exact: true }),
+        `"${visao}" foi clicado e não ficou marcado como a visão atual`,
+      ).toHaveAttribute("aria-pressed", "true");
+    }
+
+    // A régua do agora só existe quando o instante cabe na faixa desenhada.
+    // Fora dela a ausência é CORRETA, e exigir presença faria a spec ficar
+    // vermelha de madrugada — que é o defeito que este repo já pagou nos
+    // invariantes de turno.
+    //
+    // ⚠️ A FAIXA É CALCULADA COMO O COMPONENTE CALCULA, e não "7 a 21".
+    //
+    // `GradeDaAgenda.tsx` desenha quando
+    // `0 <= (hora - 7) * 60 + minuto <= (21 - 7 + 1) * 60`, ou seja até as
+    // **22:00:59** — o limite superior é `<= 900`, não `< 900`. A versão
+    // anterior desta spec comparava `hora >= 7 && hora <= 21`, e as duas réguas
+    // discordavam numa janela de UM MINUTO por dia: às 22:00 o componente ainda
+    // desenha e a spec exigia ausência.
+    //
+    // Um minuto em 1440 parece desprezível até acontecer. Aconteceu em
+    // 11/09/2026, em DOIS PRs de contribuidores diferentes, cujos `e2e`
+    // começaram às `22:00:12` e `22:00:24` — os dois ficaram vermelhos por um
+    // defeito que não era deles, num arquivo que eles não tocaram.
+    //
+    // A régua aqui passou a ser a MESMA conta do componente. Duplicar a regra
+    // continua sendo duplicação; o que muda é que agora ela duplica o que o
+    // componente faz, em vez de uma aproximação dele.
+    const agora = new Date();
+    const minutosDesdeOTopo = (agora.getHours() - 7) * 60 + agora.getMinutes();
+    const dentroDaFaixa = minutosDesdeOTopo >= 0 && minutosDesdeOTopo <= (21 - 7 + 1) * 60;
+    const regua = page.getByTestId("regua-do-agora");
+    if (dentroDaFaixa) {
+      await expect(
+        regua,
+        `dentro da faixa desenhada (${agora.getHours()}h${String(agora.getMinutes()).padStart(2, "0")}) e sem régua do agora`,
+      ).toBeVisible();
+    } else {
+      await expect(
+        regua,
+        `fora da faixa (${agora.getHours()}h${String(agora.getMinutes()).padStart(2, "0")}) e a régua apareceu mesmo assim`,
+      ).toHaveCount(0);
+    }
+  });
+
+  test("o filtro por pessoa ISOLA de verdade — clicando, no produto", async () => {
+    // O isolamento era assertado só na vitrine. Aqui o teste é sobre o efeito:
+    // clicar numa pessoa muda o que a grade mostra, e "Todos" desfaz.
+    const filtro = page.getByTestId("filtro-de-pessoas");
+    await expect(filtro).toBeVisible({ timeout: ESPERA });
+
+    const cartoes = () => page.getByTestId("grade-da-agenda").getByRole("button", { name: /\d{2}:\d{2} às \d{2}:\d{2}/ });
+    const todos = await cartoes().count();
+
+    const primeira = filtro.getByRole("button").first();
+    await primeira.click();
+    const isolado = await cartoes().count();
+    expect(
+      isolado,
+      "isolar uma pessoa não pode mostrar MAIS do que a agenda inteira",
+    ).toBeLessThanOrEqual(todos);
+    await expect(primeira, "cliquei na pessoa e ela não ficou marcada").toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    await page.getByTestId("botao-todos").click();
+    await expect
+      .poll(() => cartoes().count(), { message: "\"Todos\" não desfez o isolamento" })
+      .toBe(todos);
+  });
+
   test("evidência visual da tela do produto", async () => {
     // As três fotos que existiam eram todas da VITRINE. Esta é a primeira da
     // tela que o cliente abre.
@@ -130,8 +252,39 @@ test.describe("a Agenda como o dono do produto a usa", () => {
     await page.screenshot({ path: "evidence/calendario/tela-do-produto-celular.png", fullPage: true });
 
     const estouro = await page.evaluate(
-      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      // ⚠️ `body.scrollWidth`, NÃO `documentElement`. `app/globals.css` põe
+      // `overflow-x: clip` em `html` E em `body` (com `hidden` ANTES, como reserva
+      // para motor sem `clip` — Safari < 16). Sob `hidden` puro, que quebra
+      // o sticky da barra), o `scrollWidth` do `documentElement` era GRAMPEADO
+      // no `clientWidth`: a conta dava zero mesmo com um filho de 3000px.
+      // Medido com o chromium do repo, viewport 390x844, filho de 3000px —
+      // `visible` → 2610, `hidden` → 0, e `body.scrollWidth` = 3000 nos DOIS
+      // casos. A medida fica no `body` para não voltar a ser incapaz de falhar.
+      //
+      // A asserção existia e era incapaz de falhar. Trocar a medida é o conserto;
+      // o caso de sabotagem ao lado é o que prova que a nova consegue.
+      () => document.body.scrollWidth - document.documentElement.clientWidth,
     );
-    expect(estouro, "a tela do produto estourou a largura no celular").toBeLessThanOrEqual(0);
+    // Quem estoura, nomeado. Uma asserção que só diz "67" manda a próxima pessoa
+    // caçar o elemento na mão — e essa caçada já custou uma sessão.
+    const culpados = await page.evaluate(() => {
+      const limite = document.documentElement.clientWidth;
+      const fora: string[] = [];
+      document.querySelectorAll("*").forEach((el) => {
+        const b = el.getBoundingClientRect();
+        if (b.right > limite + 1 && b.width > 0) {
+          const e = el as HTMLElement;
+          const id = e.getAttribute("data-testid");
+          fora.push(
+            `${e.tagName.toLowerCase()}${id ? `[${id}]` : ""} right=${Math.round(b.right)} w=${Math.round(b.width)} cls=${String(e.className).slice(0, 60)}`,
+          );
+        }
+      });
+      return fora.slice(0, 5);
+    });
+    expect(
+      estouro,
+      `a tela do produto estourou a largura no celular. Quem passa da borda:\n${culpados.join("\n") || "  (nenhum elemento individual — veja margem/transform)"}`,
+    ).toBeLessThanOrEqual(0);
   });
 });

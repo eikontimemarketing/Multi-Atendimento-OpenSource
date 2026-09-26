@@ -581,14 +581,63 @@ test.describe("kit visual da Agenda", () => {
 
     const aviso = painel.getByTestId("sem-jornada-publicada");
     await expect(aviso).toBeVisible({ timeout: ESPERA });
-    await expect(aviso).toContainText("ainda não publicou");
-    // Diz o PRÓXIMO PASSO, não só a ausência.
-    await expect(aviso).toContainText(/configure|disponibilidade/i);
+    // O texto deste aviso depende de QUEM lê: "Você ainda não publicou…" só vale
+    // para o dono, e a vitrine mostra a agenda de OUTRA pessoa (`PESSOAS[3]`, o
+    // Davi) — o que aparece é a constatação sobre a jornada, sem deduzir quem
+    // falhou. A asserção cobrava o "ainda não publicou" da variante antiga
+    // (achado da triagem do #1107, item 4).
+    await expect(aviso).toContainText("A jornada de atendimento ainda não foi publicada");
+    // Diz o PRÓXIMO PASSO, não só a ausência — e o próximo passo é CLICÁVEL.
+    //
+    // Esta asserção era `toContainText(/configure|disponibilidade/i)`, e o texto
+    // passava por ela dizendo "Configure a sua disponibilidade" sem levar a lugar
+    // nenhum. O dono do produto procurou onde configurar e não achou: a tela
+    // existe (aba "Atendimento" de Equipe), o caminho é que não existia.
+    // Instrução sem caminho é acusação, e uma asserção sobre PALAVRA não
+    // distingue as duas — só a asserção sobre o DESTINO distingue.
+    const porta = aviso.getByTestId("ir-configurar-horarios");
+    await expect(porta).toBeVisible();
+    await expect(porta).toHaveAttribute("href", "/app/team?aba=atendimento");
 
     // E o painel do caso normal NÃO mostra este aviso — senão ele apareceria
     // sempre, e aviso que aparece sempre não informa nada.
     const normal = page.getByTestId("secao-marcacao").getByTestId("painel-de-marcacao");
     await expect(normal.getByTestId("sem-jornada-publicada")).toHaveCount(0);
+  });
+
+  test("o dia apagado diz POR QUÊ, e não só que está apagado", async () => {
+    /**
+     * O que o usuário via: o calendário do mês inteiro, todos os dias sem
+     * clique, e nada explicando. O aviso existia, mas dependia de OUTRO dado —
+     * o dia é apagado pelos SLOTS daquela data, o aviso pelas JANELAS lidas do
+     * banco. Dois booleanos independentes, então havia estado em que a grade
+     * trava sem avisar nada: instalação fresca (a rota devolve 422, o hook joga
+     * num toast, o `?? true` do chamador diz "publicou"), ou dois cliques em
+     * "Próximo mês", que a consulta nunca cobriu.
+     *
+     * O rótulo do dia era `— sem horário` para TUDO: dia de outro mês, dia sem
+     * vaga e dia com a consulta quebrada liam igual. Quem usa leitor de tela
+     * recebia a constatação da ausência sem a causa.
+     */
+    const painel = page.getByTestId("secao-nao-configurado").getByTestId("painel-de-marcacao");
+    await painel.scrollIntoViewIfNeeded();
+
+    const apagados = painel.locator('[data-testid^="dia-"][data-disponivel="false"]');
+    await expect(apagados.first()).toBeVisible({ timeout: ESPERA });
+
+    // O motivo tem de estar no rótulo — e ser O MOTIVO, não a constatação.
+    const rotulos = await apagados.evaluateAll((nos) =>
+      nos.map((n) => n.getAttribute("aria-label") ?? ""),
+    );
+    expect(rotulos.length, "nenhum dia apagado nesta seção — o cenário mudou").toBeGreaterThan(0);
+    expect(
+      rotulos.some((r) => /não publicou seus horários/i.test(r)),
+      `nenhum dia diz por que está apagado: ${JSON.stringify(rotulos.slice(0, 3))}`,
+    ).toBe(true);
+    expect(
+      rotulos.some((r) => /— sem horário$/.test(r)),
+      "ainda há dia com o rótulo genérico antigo, que não distingue as causas",
+    ).toBe(false);
   });
 
   test("o que a API conta além dos slots chega à tela", async () => {
@@ -639,11 +688,42 @@ test.describe("kit visual da Agenda", () => {
     await expect(page.getByTestId("grade-da-agenda")).toBeVisible({ timeout: ESPERA });
     await page.screenshot({ path: "evidence/calendario/kit-visual-celular.png", fullPage: true });
 
-    // A página NUNCA rola na horizontal: `html, body` têm `overflow-x: hidden`,
+    // A página NUNCA rola na horizontal: `html, body` têm `overflow-x: clip`,
     // então uma grade larga demais não ganharia barra — sumiria pela direita.
     const estouro = await page.evaluate(
-      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      // ⚠️ `body.scrollWidth`, NÃO `documentElement`. `app/globals.css` põe
+      // `overflow-x: clip` em `html` E em `body` (com `hidden` ANTES, como reserva
+      // para motor sem `clip` — Safari < 16). Sob `hidden` puro, que quebra
+      // o sticky da barra), o `scrollWidth` do `documentElement` era GRAMPEADO
+      // no `clientWidth`: a conta dava zero mesmo com um filho de 3000px.
+      // Medido com o chromium do repo, viewport 390x844, filho de 3000px —
+      // `visible` → 2610, `hidden` → 0, e `body.scrollWidth` = 3000 nos DOIS
+      // casos. A medida fica no `body` para não voltar a ser incapaz de falhar.
+      //
+      // A asserção existia e era incapaz de falhar. Trocar a medida é o conserto;
+      // o caso de sabotagem ao lado é o que prova que a nova consegue.
+      () => document.body.scrollWidth - document.documentElement.clientWidth,
     );
-    expect(estouro, "a página estourou a largura no celular").toBeLessThanOrEqual(0);
+    // Quem estoura, nomeado. Uma asserção que só diz "67" manda a próxima pessoa
+    // caçar o elemento na mão — e essa caçada já custou uma sessão.
+    const culpados = await page.evaluate(() => {
+      const limite = document.documentElement.clientWidth;
+      const fora: string[] = [];
+      document.querySelectorAll("*").forEach((el) => {
+        const b = el.getBoundingClientRect();
+        if (b.right > limite + 1 && b.width > 0) {
+          const e = el as HTMLElement;
+          const id = e.getAttribute("data-testid");
+          fora.push(
+            `${e.tagName.toLowerCase()}${id ? `[${id}]` : ""} right=${Math.round(b.right)} w=${Math.round(b.width)} cls=${String(e.className).slice(0, 60)}`,
+          );
+        }
+      });
+      return fora.slice(0, 5);
+    });
+    expect(
+      estouro,
+      `a página estourou a largura no celular. Quem passa da borda:\n${culpados.join("\n") || "  (nenhum elemento individual — veja margem/transform)"}`,
+    ).toBeLessThanOrEqual(0);
   });
 });

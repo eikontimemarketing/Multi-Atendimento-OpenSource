@@ -1,7 +1,10 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { test, expect } from "@playwright/test";
+
+import { escolherDiaDesenhado, irParaASemanaSeguinte } from "./helpers/agenda-semana-integra";
 
 /**
  * A PROVA EM TELA DA FRENTE 1 (API + motor) — agora ESCRITA, e o caminho até aqui
@@ -46,7 +49,23 @@ import { test, expect } from "@playwright/test";
  *          Falta a rota devolver o motivo por um caminho que a tela leia.
  */
 
-const APP_URL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000";
+/**
+ * ⚠️ SEM `APP_URL`: as navegações são RELATIVAS, e o `baseURL` do
+ * `playwright.config.ts` resolve.
+ *
+ * Isto era `process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000"`, e o
+ * fallback é o defeito: **o CI não define `PLAYWRIGHT_BASE_URL`**. Local eu
+ * exportava a variável, então passava; no runner a spec batia em `:3000`, onde
+ * não há nada, e as seis caíam em bloco com `ERR_CONNECTION_REFUSED` — que se
+ * parece com "o servidor morreu" e é "eu bati na porta errada".
+ *
+ * O log mostra o formato exato: `··········FFFFFF` — dez testes passam, os seis
+ * meus caem juntos, e os seguintes voltam a passar. Servidor vivo o tempo todo.
+ *
+ * As irmãs já faziam certo de dois jeitos: `agenda-tela-do-produto` usa caminho
+ * relativo, e `agente-marca-consulta` usa `E2E_PORT ?? 3001`. Nenhuma inventa
+ * 3000.
+ */
 const RAIZ = path.resolve(__dirname, "../..");
 
 interface Creds {
@@ -58,7 +77,22 @@ interface Creds {
 function lerCreds(): Creds {
   const p = path.join(RAIZ, ".e2e-creds.json");
   if (!fs.existsSync(p)) throw new Error("`.e2e-creds.json` ausente — rode `scripts/seed-e2e-credentials.ts`");
-  return JSON.parse(fs.readFileSync(p, "utf8")) as Creds;
+  let c = JSON.parse(fs.readFileSync(p, "utf8")) as Creds;
+  if (!c.agenda) {
+    // ⚠️ A SPEC SEMEIA O QUE PRECISA, e isto não é conveniência.
+    //
+    // O workflow do CI não roda `seed-e2e-agenda.ts` nos passos — quem o roda é
+    // `agente-marca-consulta`, no `beforeAll` dela. Depender disso seria depender
+    // da ORDEM de execução: a spec passaria por outra spec ter rodado antes, que
+    // é exatamente o defeito que `agenda-tela-do-produto` já pagou nesta entrega
+    // (ela só passava com o banco sujo de outra spec).
+    //
+    // O seed é idempotente, então chamá-lo aqui não atrapalha quem já o chamou.
+    execFileSync("npx", ["tsx", "scripts/seed-e2e-agenda.ts"], { stdio: "inherit" });
+    c = JSON.parse(fs.readFileSync(p, "utf8")) as Creds;
+  }
+  if (!c.agenda) throw new Error("seed-e2e-agenda não gravou o bloco `agenda`");
+  return c;
 }
 
 /** Compromissos desenhados na grade — o `aria-label` traz "HH:mm às HH:mm". */
@@ -90,14 +124,28 @@ test("marcar um horário pela tela e vê-lo aparecer na grade — sem recarregar
       .catch(() => respostas.push(`${r.status()} <corpo ilegível>`));
   });
 
-  await page.goto(`${APP_URL}/login`);
+  await page.goto("/login");
   await page.getByLabel(/e-?mail/i).fill(usuario.email);
   await page.getByLabel(/senha/i).fill(creds.password);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app(\/|$)/, { timeout: 20_000 });
 
-  await page.goto(`${APP_URL}/app/agenda`);
+  await page.goto("/app/agenda");
   await expect(page.getByTestId("tela-agenda")).toBeVisible({ timeout: 20_000 });
+
+  // ⚠️ A SEMANA SEGUINTE, e ela é a condição de o caso poder passar.
+  //
+  // A asserção final desta spec é `faixa-<id>` DESENHADO NA GRADE — e a grade
+  // desenha uma semana só. Enquanto o painel escolhia "o primeiro dia com vaga"
+  // e a grade ficava na semana de hoje, os dois falavam de períodos diferentes
+  // assim que hoje esgotava: depois das 17h o painel oferecia a segunda-feira, o
+  // compromisso nascia na semana seguinte, e a grade — parada na semana de sexta
+  // — nunca o desenhava. A falha lia "a grade não repinta sem F5", acusando o
+  // produto de um defeito que era do período escolhido pelo teste.
+  //
+  // Navegando primeiro, alvo e grade passam a sair da MESMA fonte: os dias que
+  // a tela desenhou. Tabela medida em `helpers/agenda-semana-integra`.
+  const diasDaSemana = await irParaASemanaSeguinte(page);
 
   const antes = await cartoesDaGrade(page).count();
 
@@ -120,9 +168,8 @@ test("marcar um horário pela tela e vê-lo aparecer na grade — sem recarregar
   await expect(page.getByTestId("tipos-de-agendamento")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: new RegExp(`^${creds.agenda.tipo_nome}`) }).click();
 
-  const dia = page.locator('[data-testid^="dia-"]:not([disabled])').first();
   try {
-    await expect(dia).toBeVisible({ timeout: 15_000 });
+    await escolherDiaDesenhado(page, diasDaSemana);
   } catch (erro) {
     // A mensagem do `expect` é avaliada ANTES de a asserção rodar, então ela não
     // pode carregar o que a rota respondeu. Enriquecer no catch é o que permite
@@ -133,7 +180,6 @@ test("marcar um horário pela tela e vê-lo aparecer na grade — sem recarregar
         `\n\n${(erro as Error).message}`,
     );
   }
-  await dia.click();
 
   const horario = page.locator('[data-testid^="horario-"]').first();
   await expect(horario, "o dia foi escolhido e não veio horário nenhum").toBeVisible({ timeout: 15_000 });
@@ -228,7 +274,7 @@ test("marcar um horário pela tela e vê-lo aparecer na grade — sem recarregar
   //
   // `page.request` reusa os cookies da sessão logada, então o DELETE passa pelo
   // mesmo caminho de autorização que um humano — não por service role.
-  const apagou = await page.request.delete(`${APP_URL}/api/v1/agenda/agendamentos`, {
+  const apagou = await page.request.delete("/api/v1/agenda/agendamentos", {
     data: { id: idCriado, reason: "limpeza da spec de marcar pela tela" },
   });
   expect(
